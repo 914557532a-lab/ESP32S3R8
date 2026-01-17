@@ -38,7 +38,7 @@ bool sendIntManual(uint32_t val) {
 //  类成员函数实现
 // ==========================================
 
-// [修复] 必须实现 init 函数，否则连接器找不到符号
+// [核心] 必须实现 init 函数，否则连接器找不到符号
 void AppServer::init(const char* ip, uint16_t port) {
     this->_server_ip = ip;
     this->_server_port = port;
@@ -103,167 +103,108 @@ void AppServer::chatWithServer(Client* networkClient) {
     
     MyUILogic.updateAssistantStatus("思考中...");
 
-    // 3. 接收并解析响应 (全缓冲下载逻辑)
+    // 3. 接收并解析 (新版：JOSN Hex -> Audio Binary Stream)
     
-    // [核心] 申请一个巨大的缓冲区用于存放完整的 PCM 音频
-    // 600KB 大约可以存放 18~19秒 的 16kHz 音频
-    size_t MAX_AUDIO_BUF = 1024 * 600; 
-    uint8_t* full_audio_buffer = (uint8_t*)ps_malloc(MAX_AUDIO_BUF);
-    size_t audio_received_len = 0;
-
-    // 内存申请失败保护
-    if (full_audio_buffer == NULL) {
-        Serial.println("[Server] PSRAM Malloc Failed (600KB)!");
-        if (isWiFi) networkClient->stop(); else My4G.closeTCP();
-        MyUILogic.finishAIState();
-        return;
-    }
-
     String jsonHex = "";
-    uint32_t startTime = millis();
     bool jsonDone = false;
-    
-    // 接收状态变量
-    uint8_t hexPair[2]; 
-    int pairIdx = 0;
+    uint32_t totalBytesReceived = 0;
     
     Serial.println("[Server] Waiting for response...");
-
-    // --- 接收大循环 (下载阶段) ---
-    while (millis() - startTime < 45000) {
-        
-        // 读取一个字节
-        int c = -1;
+    
+    // 缓冲区 (ADPCM块) 
+    uint8_t streamBuf[256]; 
+    unsigned long lastDataTime = millis();
+    
+    while (1) {
+        // 检查连接是否断开 (EOF)
         if (isWiFi) {
-            if (networkClient->connected() && networkClient->available()) {
-                c = networkClient->read();
-            } else if (!networkClient->connected()) {
-                break; 
+            if (!networkClient->connected() && !networkClient->available()) break;
+        } else {
+            // 4G 在极速模式下如何判断断开？ 
+            // 通常依靠超时或者 AT 指令判断
+            // 这里我们依靠数据流超时
+            if (millis() - lastDataTime > 5000) {
+                Serial.println("[Server] Stream Timeout.");
+                break;
+            }
+        }
+
+        // 读取数据
+        size_t r = 0;
+        if (isWiFi) {
+            if (networkClient->available()) {
+                 r = networkClient->read(streamBuf, sizeof(streamBuf));
             }
         } else {
-            uint8_t temp;
-            if (My4G.readData(&temp, 1, 10) == 1) c = temp;
-        }
-
-        if (c == -1) {
-            vTaskDelay(1);
-            continue;
-        }
-
-        // [New] Protocol Sync: Reset decoder on Newline
-        if (c == '\n') {
-            pairIdx = 0; // Reset Hex Decoder
-            continue;    // Skip the newline char
-        }
-
-        startTime = millis(); // 喂狗，保持连接活跃
-
-        if (!jsonDone) {
-            // --- 阶段1: JSON ---
-            if (c == '*') {
-                jsonDone = true;
-                Serial.println("\n[Protocol] JSON End.");
-                // 解析 JSON
-                if (jsonHex.length() > 0) {
-                    int jLen = jsonHex.length() / 2;
-                    char* jBuf = (char*)malloc(jLen + 1);
-                    if (jBuf) {
-                        for (int i=0; i<jLen; i++) jBuf[i] = (hexCharToVal(jsonHex[i*2]) << 4) | hexCharToVal(jsonHex[i*2+1]);
-                        jBuf[jLen] = 0;
-                        Serial.printf("[Protocol] JSON: %s\n", jBuf);
-                        MyUILogic.handleAICommand(String(jBuf));
-                        free(jBuf);
-                    }
+            // 4G 读取 (如果缓冲区空则返回0)
+            int val = My4G.popCache(); // 先查缓存
+            if (val != -1) {
+                streamBuf[0] = (uint8_t)val;
+                r = 1;
+                // 贪婪读取后续
+                while(r < sizeof(streamBuf)) {
+                    int v2 = My4G.popCache();
+                    if(v2 == -1) break;
+                    streamBuf[r++] = (uint8_t)v2;
                 }
-                Serial.println("[Protocol] Downloading Audio to Buffer...");
-                MyUILogic.updateAssistantStatus("正在接收...");
-            } 
-            else if (c != '\n' && c != '\r') {
-                jsonHex += (char)c;
+            } else {
+                 My4G.process4GStream(); // 触发泵
             }
-        } 
-        else {
-            // --- 阶段2: Audio (存入大缓冲区，不播放) ---
-            if (c == '*') {
-                Serial.println("[Protocol] Audio Download End (*).");
-                break; // 下载完成，跳出循环
-            }
+        }
+
+        if (r > 0) {
+            lastDataTime = millis();
             
-            // 简单的 Hex 过滤
-            if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'))) continue;
-
-            hexPair[pairIdx++] = c;
-            if (pairIdx == 2) {
-                // 解码
-                uint8_t pcmByte = (hexCharToVal(hexPair[0]) << 4) | hexCharToVal(hexPair[1]);
-                pairIdx = 0;
+            // --- 分发数据 ---
+            for (size_t i = 0; i < r; i++) {
+                uint8_t c = streamBuf[i];
                 
-                // [核心] 存入大缓冲区，防止溢出
-                if (audio_received_len < MAX_AUDIO_BUF) {
-                    full_audio_buffer[audio_received_len++] = pcmByte;
-                }
-                
-                // 每接收 10KB 打印一下进度，防止看门狗以为死了
-                if (audio_received_len % 10240 == 0) {
-                    Serial.printf(".");
-                    vTaskDelay(1); 
+                if (!jsonDone) {
+                    // Phase 1: JSON (Hex + '*')
+                    if (c == '*') {
+                        jsonDone = true;
+                        Serial.println("\n[Protocol] JSON End. Start Audio Stream...");
+                        MyUILogic.updateAssistantStatus("正在回复"); // 收到 * 立刻显示正在回复
+                        
+                        // Parse JSON
+                        if (jsonHex.length() > 0) {
+                            int jLen = jsonHex.length() / 2;
+                            char* jBuf = (char*)malloc(jLen + 1);
+                            if (jBuf) {
+                                for (int k=0; k<jLen; k++) jBuf[k] = (hexCharToVal(jsonHex[k*2]) << 4) | hexCharToVal(jsonHex[k*2+1]);
+                                jBuf[jLen] = 0;
+                                Serial.printf("[Protocol] JSON: %s\n", jBuf);
+                                MyUILogic.handleAICommand(String(jBuf));
+                                free(jBuf);
+                            }
+                        }
+                    } 
+                    else if (c != '\n' && c != '\r') {
+                        jsonHex += (char)c;
+                    }
+                } else {
+                    // Phase 2: Audio (Raw Binary ADPCM)
+                    // 直接推入播放缓冲 -> 后台解码任务会自动消费
+                    // 这里不需要做任何处理，直接是 ADPCM 字节
+                    MyAudio.pushToPlayBuffer(&c, 1);
+                    totalBytesReceived++;
+                    if (totalBytesReceived % 1024 == 0) Serial.print(".");
                 }
             }
+        } else {
+             vTaskDelay(1);
         }
     }
 
-    // 4. 断开网络连接 (确保无干扰)
-    Serial.println("\n[Server] Closing Network...");
+    Serial.printf("\n[Server] Stream Finished. Total: %d bytes.\n", totalBytesReceived);
+
+    // 等待播放缓冲排空 (给一点时间让 tail 追上 head)
+    // 但不要死等，因为 playAudioTask 会一直运行
+    vTaskDelay(500);
+
+    // 4. 断开连接
     if (isWiFi) networkClient->stop();
     else My4G.closeTCP();
     
-
-    // 5. 开始播放 (Playback Phase)
-    if (audio_received_len > 0) {
-        // [Fix] Enforce Even Length (Align to 16-bit)
-        if (audio_received_len % 2 != 0) {
-            audio_received_len--; 
-            Serial.println("[Server] Truncated 1 byte to align PCM.");
-        }
-
-        Serial.printf("[Server] Start Playing Buffered Audio: %d bytes\n", audio_received_len);
-        MyUILogic.updateAssistantStatus("正在回复");
-        
-        size_t played = 0;
-        size_t chunk_size = 512; // 每次推 512 字节
-        
-        // --- 推送循环 ---
-        while (played < audio_received_len) {
-            size_t remain = audio_received_len - played;
-            size_t current_chunk = (remain > chunk_size) ? chunk_size : remain;
-            
-            // 推送数据到 RingBuffer
-            // 注意：App_Audio 中的 pushToPlayBuffer 是阻塞式的 (Blocking)
-            // 如果 RingBuffer 满了，这里会自动等待，直到播放任务消耗掉数据
-            // 这样 600KB 数据就会平滑地流过 200KB 的 RingBuffer
-            MyAudio.pushToPlayBuffer(full_audio_buffer + played, current_chunk);
-            
-            played += current_chunk;
-            
-            // 喂狗，防止播放时间过长导致重启
-            vTaskDelay(2); 
-        }
-
-        // [Fix] Append Silence Padding (2KB Zeros)
-        // Eliminates static/pop noise at the end of playback
-        Serial.println("[Server] Appending Silence Padding...");
-        uint8_t silence_buf[512] = {0}; 
-        for(int i=0; i<4; i++) { // 4 * 512 = 2048 bytes
-             MyAudio.pushToPlayBuffer(silence_buf, 512);
-             vTaskDelay(2);
-        }
-    } else {
-        Serial.println("[Server] No Audio received.");
-    }
-
-    // 6. 释放大内存
-    free(full_audio_buffer);
-    Serial.println("[Server] Playback Finished. Buffer Freed.");
-
     MyUILogic.finishAIState();
 }

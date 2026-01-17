@@ -137,73 +137,179 @@ void AppAudio::playStream(Client* client, int length) {
     }
 }
 
+// ==========================================
+//  IMA ADPCM Helper (Tables & Structs)
+// ==========================================
+const int8_t index_table[16] = {
+    -1, -1, -1, -1, 2, 4, 6, 8,
+    -1, -1, -1, -1, 2, 4, 6, 8
+};
+
+const int step_size_table[89] = {
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
+    19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
+    50, 55, 60, 66, 73, 80, 88, 97, 107, 118,
+    130, 143, 157, 173, 190, 209, 230, 253, 279, 307,
+    337, 371, 408, 449, 494, 544, 598, 658, 724, 796,
+    876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
+    2272, 2499, 2749, 3024, 3326, 3658, 4024, 4428, 4871, 5358,
+    5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899,
+    15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767
+};
+
+struct AdpcmState {
+    int32_t valprev;
+    int8_t index;
+};
+
+// ==========================================
+//  IMA ADPCM Decoder
+// ==========================================
+int16_t adpcm_decode(uint8_t code, AdpcmState *state) {
+    int step = step_size_table[state->index];
+    int diffq = step >> 3;
+    if (code & 4) diffq += step;
+    if (code & 2) diffq += (step >> 1);
+    if (code & 1) diffq += (step >> 2);
+    
+    if (code & 8) state->valprev -= diffq;
+    else state->valprev += diffq;
+    
+    if (state->valprev > 32767) state->valprev = 32767;
+    else if (state->valprev < -32768) state->valprev = -32768;
+    
+    state->index += index_table[code];
+    if (state->index < 0) state->index = 0;
+    if (state->index > 88) state->index = 88;
+    
+    return (int16_t)state->valprev;
+}
+
+// ==========================================
+//  IMA ADPCM Encoder
+// ==========================================
+uint8_t adpcm_encode(int16_t sample1, int16_t sample2, AdpcmState *state) {
+    uint8_t code = 0;
+    
+    // Sample 1
+    int diff = sample1 - state->valprev;
+    int sign = (diff < 0) ? 8 : 0;
+    if (diff < 0) diff = -diff;
+    
+    int step = step_size_table[state->index];
+    int delta = 0;
+    int vpdiff = (step >> 3);
+    
+    if (diff >= step) { delta |= 4; diff -= step; vpdiff += step; }
+    if (diff >= (step >> 1)) { delta |= 2; diff -= (step >> 1); vpdiff += (step >> 1); }
+    if (diff >= (step >> 2)) { delta |= 1; vpdiff += (step >> 2); }
+    
+    if (sign) state->valprev -= vpdiff;
+    else state->valprev += vpdiff;
+    
+    if (state->valprev > 32767) state->valprev = 32767;
+    else if (state->valprev < -32768) state->valprev = -32768;
+    
+    state->index += index_table[delta | sign];
+    if (state->index < 0) state->index = 0;
+    if (state->index > 88) state->index = 88;
+    
+    code = (delta | sign); // Low nibble
+
+    // Sample 2
+    diff = sample2 - state->valprev;
+    sign = (diff < 0) ? 8 : 0;
+    if (diff < 0) diff = -diff;
+    
+    step = step_size_table[state->index];
+    delta = 0;
+    vpdiff = (step >> 3);
+    
+    if (diff >= step) { delta |= 4; diff -= step; vpdiff += step; }
+    if (diff >= (step >> 1)) { delta |= 2; diff -= (step >> 1); vpdiff += (step >> 1); }
+    if (diff >= (step >> 2)) { delta |= 1; vpdiff += (step >> 2); }
+    
+    if (sign) state->valprev -= vpdiff;
+    else state->valprev += vpdiff;
+    
+    if (state->valprev > 32767) state->valprev = 32767;
+    else if (state->valprev < -32768) state->valprev = -32768;
+    
+    state->index += index_table[delta | sign];
+    if (state->index < 0) state->index = 0;
+    if (state->index > 88) state->index = 88;
+    
+    code |= ((delta | sign) << 4); // High nibble
+    
+    return code;
+}
+
 void AppAudio::startRecording() {
     if (isRecording) return;
     if (!record_buffer) return;
     board.setInputVolume(85); 
-    record_data_len = 44; 
+    
+    // [ADPCM] 重置压缩后长度计数。无需保留 44字节头，因为我们传的是纯数据
+    record_data_len = 0; 
+    
     isRecording = true;
     xTaskCreate(recordTaskWrapper, "RecTask", 8192, this, 10, &recordTaskHandle);
-    Serial.println("[Audio] Start Rec");
+    Serial.println("[Audio] Start Rec (ADPCM)");
 }
 
 void AppAudio::stopRecording() {
     isRecording = false; 
     delay(100); 
     board.setInputVolume(0); 
-    uint32_t pcm_size = record_data_len - 44;
-    createWavHeader(record_buffer, pcm_size, AUDIO_SAMPLE_RATE, 16, 2);
+    // [ADPCM] 这里不再需要生成 WAV 头，因为数据是 ADPCM
+    Serial.printf("[Audio] Stop Rec. Encoded Size: %d\n", record_data_len);
 }
 
 void AppAudio::_recordTask(void *param) {
-    const size_t read_size = 1024; 
+    const size_t read_size = 1024; // 读取 PCM 字节 (512 samples)
     uint8_t temp_buf[read_size]; 
+    
+    AdpcmState rec_state = {0, 0}; // 编码状态
+
     while (isRecording) {
+        // 读取 I2S 数据
         size_t bytes_read = i2s.readBytes(temp_buf, read_size);
+        
         if (bytes_read > 0) {
-            if (record_data_len + bytes_read < MAX_RECORD_SIZE) {
-                memcpy(record_buffer + record_data_len, temp_buf, bytes_read);
-                record_data_len += bytes_read;
-            } else isRecording = false; 
-        } else vTaskDelay(1);
+            // PCM (16-bit) -> ADPCM (4-bit)
+            // 压缩率 4:1。 bytes_read (PCM字节) -> bytes_read / 4 (ADPCM字节)
+            
+            size_t sample_count = bytes_read / 2;
+            int16_t* pcm_samples = (int16_t*)temp_buf;
+            
+            // 确保我们有足够的空间
+            if (record_data_len + (sample_count / 2) < MAX_RECORD_SIZE) {
+                
+                for (size_t i = 0; i < sample_count; i += 2) {
+                     int16_t s1 = pcm_samples[i];
+                     int16_t s2 = (i + 1 < sample_count) ? pcm_samples[i+1] : 0;
+                     
+                     uint8_t code = adpcm_encode(s1, s2, &rec_state);
+                     record_buffer[record_data_len++] = code;
+                }
+            } else {
+                 isRecording = false; // 缓冲满
+                 Serial.println("[Audio] Rec Buffer Full!");
+            }
+        } else {
+            vTaskDelay(1);
+        }
     }
 }
 
 void AppAudio::createWavHeader(uint8_t *header, uint32_t totalDataLen, uint32_t sampleRate, uint8_t sampleBits, uint8_t numChannels) {
-    uint32_t byteRate = sampleRate * numChannels * (sampleBits / 8);
-    uint32_t totalFileSize = totalDataLen + 44 - 8;
-    // (WAV头生成代码保持原样，省略以节省篇幅，功能不变)
-    // ... 请保持原有的 WAV Header 生成逻辑 ...
-    header[0] = 'R'; header[1] = 'I'; header[2] = 'F'; header[3] = 'F';
-    header[4] = (uint8_t)(totalFileSize & 0xFF);
-    header[5] = (uint8_t)((totalFileSize >> 8) & 0xFF);
-    header[6] = (uint8_t)((totalFileSize >> 16) & 0xFF);
-    header[7] = (uint8_t)((totalFileSize >> 24) & 0xFF);
-    header[8] = 'W'; header[9] = 'A'; header[10] = 'V'; header[11] = 'E';
-    header[12] = 'f'; header[13] = 'm'; header[14] = 't'; header[15] = ' ';
-    header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0;
-    header[20] = 1; header[21] = 0; 
-    header[22] = numChannels; header[23] = 0; 
-    header[24] = (uint8_t)(sampleRate & 0xFF);
-    header[25] = (uint8_t)((sampleRate >> 8) & 0xFF);
-    header[26] = (uint8_t)((sampleRate >> 16) & 0xFF);
-    header[27] = (uint8_t)((sampleRate >> 24) & 0xFF);
-    header[28] = (uint8_t)(byteRate & 0xFF);
-    header[29] = (uint8_t)((byteRate >> 8) & 0xFF);
-    header[30] = (uint8_t)((byteRate >> 16) & 0xFF);
-    header[31] = (uint8_t)((byteRate >> 24) & 0xFF);
-    header[32] = (uint8_t)(numChannels * (sampleBits / 8)); header[33] = 0; 
-    header[34] = sampleBits; header[35] = 0;
-    header[36] = 'd'; header[37] = 'a'; header[38] = 't'; header[39] = 'a';
-    header[40] = (uint8_t)(totalDataLen & 0xFF);
-    header[41] = (uint8_t)((totalDataLen >> 8) & 0xFF);
-    header[42] = (uint8_t)((totalDataLen >> 16) & 0xFF);
-    header[43] = (uint8_t)((totalDataLen >> 24) & 0xFF);
+    // [ADPCM] 此函数对于 ADPCM 来说已无用，但保留以防万一
 }
 
 // ==========================================
 //  后台任务具体实现
 // ==========================================
+
 
 void audioPlayTask(void *param) {
     AppAudio *audio = (AppAudio *)param;
@@ -211,40 +317,52 @@ void audioPlayTask(void *param) {
     unsigned long last_audio_time = millis();
     bool pa_enabled = false;
     const int PA_TIMEOUT_MS = 2000;
+    
+    // ADPCM State Reset
+    AdpcmState state = {0, 0};
+
+    int16_t out_pcm_stereo[2]; // Stereo sample
 
     while (1) {
-        // [修复] 这里访问 audio->playRingBuf 没问题，因为现在它是 public 的
-        uint8_t *item = (uint8_t *)xRingbufferReceive(audio->playRingBuf, &item_size, pdMS_TO_TICKS(100));
+        // 从 RingBuffer 读取 COMPRESSED ADPCM 数据
+        // 每次读取一小块，例如 128 bytes
+        uint8_t *item = (uint8_t *)xRingbufferReceive(audio->playRingBuf, &item_size, pdMS_TO_TICKS(10));
         
         if (item != NULL) {
             if (!pa_enabled) {
                 digitalWrite(PIN_PA_EN, HIGH);
                 pa_enabled = true;
+                // Reset state on new stream start? 
+                // Currently just continuous, maybe slight glitch at start but acceptable
             }
             last_audio_time = millis();
 
-            // Mono -> Stereo
-            size_t samples = item_size / 2;
-            int16_t *pcm_in = (int16_t *)item;
-            int16_t stereo_batch[256]; 
-            size_t processed = 0;
-            
-            while(processed < samples) {
-                size_t chunk = (samples - processed) > 128 ? 128 : (samples - processed);
-                for(int i=0; i<chunk; i++) {
-                     int16_t val = pcm_in[processed + i];
-                     stereo_batch[i*2] = val;
-                     stereo_batch[i*2+1] = val;
-                }
-                i2s.write((uint8_t*)stereo_batch, chunk * 4);
-                processed += chunk;
+            // Decode Loop
+            for (size_t i = 0; i < item_size; i++) {
+                uint8_t byte = item[i];
+                
+                // Sample 1 (Low Nibble)
+                int16_t s1 = adpcm_decode(byte & 0x0F, &state);
+                out_pcm_stereo[0] = s1; out_pcm_stereo[1] = s1;
+                i2s.write((uint8_t*)out_pcm_stereo, 4);
+
+                // Sample 2 (High Nibble)
+                int16_t s2 = adpcm_decode((byte >> 4) & 0x0F, &state);
+                out_pcm_stereo[0] = s2; out_pcm_stereo[1] = s2;
+                i2s.write((uint8_t*)out_pcm_stereo, 4);
             }
+            
             vRingbufferReturnItem(audio->playRingBuf, (void *)item);
         } else {
+            // Buffer Empty
             if (pa_enabled && (millis() - last_audio_time > PA_TIMEOUT_MS)) {
                 digitalWrite(PIN_PA_EN, LOW);
                 pa_enabled = false;
+                // Reset State when idle
+                state.valprev = 0;
+                state.index = 0;
             }
+            vTaskDelay(1);
         }
     }
 }
