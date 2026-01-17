@@ -42,6 +42,9 @@ public:
     // data: 字节数组, len: 字节长度(通常AUX是13)
     void sendCoolix(uint32_t data);
 
+    // [新增] 发送 QD-HS6324 (Hex String format: "B24DA0...")
+    void sendQDHSString(String hexStr);
+
 private:
     IRrecv* _irRecv = nullptr;
     IRsend* _irSend = nullptr;

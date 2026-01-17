@@ -132,3 +132,80 @@ void AppIR::sendCoolix(uint32_t data) {
     _irRecv->enableIRIn(); 
     Serial.println("[IR] Coolix Sent.");
 }
+
+// [新增] 实现 QD-HS6324 协议发送
+// 参数: hexStr 例如 "B24DA05FD02F"
+void AppIR::sendQDHSString(String hexStr) {
+    if (hexStr.length() == 0 || hexStr.length() % 2 != 0) {
+        Serial.println("[IR] Error: Invalid Hex String");
+        return;
+    }
+
+    Serial.printf("[IR] Sending QD-HS6324 Raw: %s\n", hexStr.c_str());
+
+    // 1. 解析 Hex 串 -> Bytes
+    int len = hexStr.length() / 2;
+    uint8_t* dataBytes = (uint8_t*)malloc(len);
+    for (int i = 0; i < len; i++) {
+        char high = hexStr[i * 2];
+        char low = hexStr[i * 2 + 1];
+        
+        uint8_t hVal = (high >= 'A') ? (high - 'A' + 10) : (high - '0');
+        if (high >= 'a') hVal = high - 'a' + 10; // 支持小写
+        
+        uint8_t lVal = (low >= 'A') ? (low - 'A' + 10) : (low - '0');
+        if (low >= 'a') lVal = low - 'a' + 10;
+        
+        dataBytes[i] = (hVal << 4) | lVal;
+    }
+
+    // 2. 构造 Raw Buffer
+    // 协议时序 (us):
+    // Leader: 4350, 4350
+    // 0: 580, 580
+    // 1: 580, 1580
+    // Stop: 580, 5290 (仅在多帧中间用，这里暂定单帧)
+    // End: 580 (Header Mark for shutdown? No, it's trail mark)
+    // 实际: 单帧 = Leader + Data + EndMark (580us)
+    
+    // 计算 buffer size: Header(2) + Bits(len*8)*2 + Footer(1)
+    // uint16_t bufferSize = 2 + len * 8 * 2 + 1; 
+    // 使用 vector 或 dynamic array
+    uint16_t* rawBuf = new uint16_t[200]; // 够用就行
+    int idx = 0;
+
+    // A. Leader
+    rawBuf[idx++] = 4350;
+    rawBuf[idx++] = 4350;
+
+    // B. Data
+    for (int i = 0; i < len; i++) {
+        for (int b = 7; b >= 0; b--) { // MSB First
+            rawBuf[idx++] = 580; // Mark
+            if ((dataBytes[i] >> b) & 1) {
+                rawBuf[idx++] = 1580; // Space for 1
+            } else {
+                rawBuf[idx++] = 580;  // Space for 0
+            }
+        }
+    }
+
+    // C. End Mark
+    rawBuf[idx++] = 580; 
+
+    // 3. 发送
+    IRsend tempSender(PIN_IR_TX);
+    tempSender.begin();
+    tempSender.sendRaw(rawBuf, idx, 38); // 38kHz
+
+    // 4. 清理
+    delete[] rawBuf;
+    free(dataBytes);
+
+    // 5. 恢复 AC
+    ac.begin();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    _irRecv->enableIRIn();
+    
+    Serial.println("[IR] QD-HS6324 Sent.");
+}

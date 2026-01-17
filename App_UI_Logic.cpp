@@ -6,6 +6,7 @@
 #include <time.h> 
 #include <ArduinoJson.h> 
 #include "App_Sys.h"
+#include "App_IR.h"
 
 AppUILogic MyUILogic;
 
@@ -55,11 +56,19 @@ void AppUILogic::handleAICommand(String jsonString) {
     if (strcmp(target, "空调") == 0) {
         if (strcmp(action, "开") == 0) {
              Serial.println(">>> 正在开启空调...");
-             // sendIRCode_AC_ON();
         } else if (strcmp(action, "关") == 0) {
              Serial.println(">>> 正在关闭空调...");
         } else if (strcmp(action, "调节") == 0) {
              Serial.printf(">>> 调节空调温度至: %s\n", value);
+        }
+
+        // [新增] 检查是否有 ir_code 并发送
+        if (doc["control"].containsKey("ir_code")) {
+            const char* ir_code = doc["control"]["ir_code"];
+            if (ir_code && strlen(ir_code) > 0) {
+                Serial.printf("[IRQ] 执行红外发送: %s\n", ir_code);
+                MyIR.sendQDHSString(String(ir_code));
+            }
         }
     } 
     else if (strcmp(target, "灯") == 0) {
