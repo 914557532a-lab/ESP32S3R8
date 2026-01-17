@@ -35,41 +35,137 @@ bool App4G::waitResponse(const char* expected, uint32_t timeout) {
 bool App4G::checkBaudrate(uint32_t baud) {
     _serial4G->updateBaudRate(baud);
     delay(50);
+    // Clear buffer
     while (_serial4G->available()) _serial4G->read(); 
-    _serial4G->println("AT");
-    return waitResponse("OK", 200);
+    
+    _serial4G->print("AT\r\n");
+    
+    // Custom wait response for baud check
+    unsigned long start = millis();
+    String recv = "";
+    while (millis() - start < 500) { // Increased timeout
+        if (_serial4G->available()) {
+            char c = _serial4G->read();
+            Serial.write(c); // Debug echo
+            recv += c;
+            if (recv.indexOf("OK") != -1) return true;
+            if (recv.indexOf("ERROR") != -1) return true; // ERROR means baud is good, just command failed
+            if (recv.indexOf("AT") != -1 && recv.length() > 4) {
+                 // We saw AT echo + something else, likely good
+                 return true;
+            }
+        }
+        vTaskDelay(1);
+    }
+    return false;
 }
 
 void App4G::powerOn() {
-    digitalWrite(PIN_4G_PWR, HIGH); delay(500);
+    digitalWrite(PIN_4G_PWR, HIGH); 
+    // Give it some time to power up physically
+    delay(2000); 
 
-    // 锁定 115200 波特率 (最稳)
-    uint32_t targetBaud = 115200; 
-    
-    // 必须先 begin
-    _serial4G->begin(targetBaud, SERIAL_8N1, PIN_4G_RX, PIN_4G_TX);
+    // Initialize Serial Port
+    _serial4G->begin(115200, SERIAL_8N1, PIN_4G_RX, PIN_4G_TX);
     delay(100);
 
-    Serial.println("[4G] Trying to sync baudrate...");
-    if (!checkBaudrate(targetBaud)) {
-        if (checkBaudrate(460800)) {
-            _serial4G->printf("AT+IPR=%d\r\n", targetBaud); delay(200);
-        } else if (checkBaudrate(921600)) {
-            _serial4G->printf("AT+IPR=%d\r\n", targetBaud); delay(200);
-        } else {
-            // 硬件复位
-            Serial.println("[4G] Hard Resetting...");
-            pinMode(PIN_4G_PWRKEY, OUTPUT);
-            digitalWrite(PIN_4G_PWRKEY, HIGH); delay(100);
-            digitalWrite(PIN_4G_PWRKEY, LOW);  delay(2500);
-            digitalWrite(PIN_4G_PWRKEY, HIGH); pinMode(PIN_4G_PWRKEY, INPUT);
-            delay(10000);
+    uint32_t targetBaud = 115200; 
+    bool synced = false;
+
+    Serial.println("[4G] Powering On & Syncing...");
+
+    // 尝试同步波特率 (最多尝试 5 次循环)
+    for (int i = 0; i < 5; i++) {
+        Serial.printf("[4G] Sync Attempt %d...\n", i + 1);
+
+        // 1. 尝试 115200 (默认/目标)
+        if (checkBaudrate(115200)) {
+            Serial.println("[4G] Synced at 115200!");
+            synced = true;
+            break;
+        }
+
+        // 2. 尝试 921600 (之前可能被修改过)
+        if (checkBaudrate(921600)) {
+            Serial.println("[4G] Found at 921600, resetting to 115200...");
+            _serial4G->print("AT+IPR=115200\r\n"); 
+            delay(500); // 等待生效
+            // 切回 115200 验证
+            if (checkBaudrate(115200)) {
+                synced = true;
+                break;
+            }
+        }
+        
+        // 3. 尝试 460800
+         if (checkBaudrate(460800)) {
+            Serial.println("[4G] Found at 460800, resetting to 115200...");
+            _serial4G->print("AT+IPR=115200\r\n"); 
+            delay(500);
+            if (checkBaudrate(115200)) {
+                synced = true;
+                break;
+            }
         }
     }
-    
-    _serial4G->updateBaudRate(targetBaud);
-    _serial4G->println("AT"); waitResponse("OK", 1000);
-    _serial4G->println("ATE0"); waitResponse("OK", 500); 
+
+    // 如果还没有同步成功，尝试硬件复位
+    if (!synced) {
+        Serial.println("[4G] Sync failed. Performing Hard Reset...");
+        pinMode(PIN_4G_PWRKEY, OUTPUT);
+        digitalWrite(PIN_4G_PWRKEY, HIGH); delay(100);
+        digitalWrite(PIN_4G_PWRKEY, LOW);  delay(2500); // 拉低至少 2s 关机/复位
+        digitalWrite(PIN_4G_PWRKEY, HIGH); pinMode(PIN_4G_PWRKEY, INPUT);
+        
+        // 复位后等待模块重启 (至少 10s)
+        Serial.println("[4G] Waiting for reboot...");
+        delay(10000); 
+        
+        // 复位后再次尝试 115200
+         if (checkBaudrate(115200)) {
+             synced = true;
+         } else {
+             // 如果复位后还不行，可能是模块处于自动波特率模式，多发几个 AT 激活
+             _serial4G->updateBaudRate(115200);
+             for(int k=0; k<10; k++) {
+                 _serial4G->print("AT\r\n"); // Keep trying
+                 delay(500); // Wait longer
+                 if(_serial4G->available()) {
+                     synced = true;
+                     break;
+                 }
+             }
+         }
+    }
+
+    if (synced) {
+        Serial.println("[4G] Module Ready (Signal Detected). Stabilizing...");
+        
+        _serial4G->updateBaudRate(115200);
+        
+        // 尝试“打通” AT 指令，直到收到 OK
+        bool at_ok = false;
+        for (int i=0; i<10; i++) {
+            _serial4G->print("AT\r\n");
+            delay(100);
+            if (waitResponse("OK", 500)) {
+                at_ok = true;
+                break;
+            }
+            // 清空多余的字符
+            while(_serial4G->available()) Serial.write(_serial4G->read());
+        }
+        
+        if (at_ok) {
+            Serial.println("[4G] AT Command OK!");
+            _serial4G->println("ATE0"); // 关闭回显
+            waitResponse("OK", 500); 
+        } else {
+            Serial.println("[4G] Warning: Module responding but AT not OK.");
+        }
+    } else {
+        Serial.println("[4G] CRITICAL: Module not responding!");
+    }
 
     if (_modem == nullptr) _modem = new TinyGsm(*_serial4G);
     if (_client == nullptr) _client = new TinyGsmClient(*_modem);

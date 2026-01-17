@@ -18,12 +18,12 @@
 #include "App_433.h"
 
 // =========================================================================
-//  SERVER CONFIGURATION (在此处修改服务器地址)
+//  SERVER CONFIGURATION (修改服务器地址)
 // =========================================================================
 
-// --- 方案 A: 你的 cpolar 公网地址 (车载/远程使用) ---
-#define SERVER_HOST  "7.tcp.vip.cpolar.cn"
-#define SERVER_PORT  11592 
+// --- 方案 A:  cpolar 公网地址 (车载/远程使用) ---
+#define SERVER_HOST  "2.tcp.cpolar.cn"
+#define SERVER_PORT  14742 
 
 // --- 方案 B: 本地局域网地址 (开发/调试使用) ---
 // #define SERVER_HOST  "192.168.1.53"
